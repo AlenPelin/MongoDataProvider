@@ -37,7 +37,7 @@ namespace MongoDataProvider.Data
 
     public override string ToString()
     {
-      return string.Format("{0} ({1})", this.Name, this._id);
+      return string.Format("{0} ({1})", this.Name, this.ID);
     }
   }
 }

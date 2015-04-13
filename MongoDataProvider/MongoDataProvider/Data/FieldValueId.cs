@@ -28,7 +28,6 @@ namespace MongoDataProvider.Data
   {
     public Guid FieldId { get; set; }
 
-    [NotNull]
     public string Language { get; set; }
 
     public int? Version { get; set; }

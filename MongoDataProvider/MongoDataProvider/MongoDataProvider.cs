@@ -21,16 +21,21 @@ namespace MongoDataProvider
 {
   using System;
   using System.Collections.Generic;
+  using System.IO;
   using System.Linq;
   using Data;
+  using MongoDB.Bson;
   using MongoDB.Driver;
   using MongoDB.Driver.Builders;
+  using MongoDB.Driver.GridFS;
   using Sitecore;
   using Sitecore.Caching;
   using Sitecore.Collections;
   using Sitecore.Configuration;
   using Sitecore.Data;
   using Sitecore.Data.DataProviders;
+  using Sitecore.Data.Items;
+  using Sitecore.Data.Managers;
   using Sitecore.Diagnostics;
 
   /// <summary>
@@ -44,21 +49,30 @@ namespace MongoDataProvider
     /// The ID of the item that is the parent of all data in this provider.
     /// </summary>
     [NotNull]
-    private ID JoinParentId { get; set; }
+    private readonly ID joinParentId;
 
     [NotNull]
-    private MongoServer Server { get; set; }
+    private readonly MongoDatabase database;
 
     [NotNull]
-    private MongoDatabase Db { get; set; }
+    private readonly MongoCollection<Data.Item> items;
 
     [NotNull]
-    private MongoCollection<Item> Items { get; set; }
+    private readonly MongoGridFS gridFs;
 
     /// <summary>
     /// If true, MongoDB ensures that data is written to disk when inserting/updating (slower, but more reliable).
     /// </summary>
-    private SafeMode SafeMode { get; set; }
+    [NotNull]
+    private readonly SafeMode safeMode;
+
+    [NotNull]
+    private readonly object prefetchCacheLock = new object();
+
+    private readonly long prefetchCacheSize = Settings.Caching.DefaultDataCacheSize;
+
+    [CanBeNull]
+    private Cache prefetchCache;
 
     public MongoDataProvider([NotNull] string joinParentId, [NotNull] string mongoConnectionString, [NotNull] string databaseName, [NotNull] string safeMode)
     {
@@ -68,170 +82,178 @@ namespace MongoDataProvider
       Assert.ArgumentNotNull(safeMode, "safeMode");
 
       bool parsedSafeMode;
-      SafeMode = SafeMode.Create(bool.TryParse(safeMode, out parsedSafeMode) ? parsedSafeMode : false);
+      var mode = SafeMode.Create(bool.TryParse(safeMode, out parsedSafeMode) && parsedSafeMode);
+      Assert.IsNotNull(mode, "mode");
 
-      JoinParentId = new ID(joinParentId);
+      var server = new MongoClient(mongoConnectionString).GetServer();
+      Assert.IsNotNull(server, "server");
 
-      Server = MongoServer.Create(mongoConnectionString);
+      var db = server.GetDatabase(databaseName);
+      Assert.IsNotNull(db, "db");
 
-      Db = Server.GetDatabase(databaseName);
+      var mongoGridFs = db.GridFS;
+      Assert.IsNotNull(mongoGridFs, "mongoGridFs");
+      
+      var collection = this.GetItemsCollection(db, mode);
 
-      Items = Db.GetCollection<Item>("items", SafeMode);
-
-      Items.EnsureIndex(IndexKeys.Ascending(new[] { "ParentID" }));
-      Items.EnsureIndex(IndexKeys.Ascending(new[] { "TemplateID" }));
-
-      EnsureNotEmpty();
+      this.database = db;
+      this.gridFs = mongoGridFs;
+      this.joinParentId = new ID(joinParentId);
+      this.safeMode = mode;
+      this.items = collection;
     }
 
-    /// <summary>
-    /// Prefills the database with a root item, if it is not available.
-    /// </summary>
-    private void EnsureNotEmpty()
-    {
-      if (Items.Count() > 0)
-      {
-        return;
-      }
-
-      // Create a root item and insert it
-      Item rootItem = new Item()
-          {
-            _id = new ID("{11111111-1111-1111-1111-111111111111}").ToGuid(),
-            Name = "sitecore",
-            TemplateID = new ID("{C6576836-910C-4A3D-BA03-C277DBD3B827}").ToGuid()
-          };
-      Items.Insert(rootItem, SafeMode);
-      AddVersion(
-          new ItemDefinition(new ID(rootItem._id), rootItem.Name, new ID(rootItem.TemplateID), ID.Null),
-          new VersionUri(Sitecore.Data.Managers.LanguageManager.DefaultLanguage, Sitecore.Data.Version.First),
-          null);
-    }
-
-    private Cache prefetchCache { get; set; }
-    protected readonly object PrefetchCacheLock = new object();
-    private long prefetchCacheSize = Settings.Caching.DefaultDataCacheSize;
-
+    [NotNull]
     protected Cache PrefetchCache
     {
       get
       {
-        if (prefetchCache != null)
+        var cache = this.prefetchCache;
+        if (cache != null)
         {
-          return this.prefetchCache;
+          return cache;
         }
-        lock (PrefetchCacheLock)
+
+        lock (this.prefetchCacheLock)
         {
-          if (prefetchCache == null)
+          cache = this.prefetchCache;
+          if (cache != null)
           {
-            string name = "MongoDataProvider - Prefetch data";
-            Cache namedInstance = Cache.GetNamedInstance(name, prefetchCacheSize);
-            if (CacheOptions.DisableAll)
-            {
-              namedInstance.Enabled = false;
-            }
-            this.prefetchCache = namedInstance;
+            return cache;
           }
-          return this.prefetchCache;
+
+          const string Name = "MongoDataProvider - Prefetch data";
+
+          cache = Cache.GetNamedInstance(Name, this.prefetchCacheSize);
+          Assert.IsNotNull(cache, "cache");
+
+          var cacheOptions = this.CacheOptions;
+          if (cacheOptions != null && cacheOptions.DisableAll)
+          {
+            cache.Enabled = false;
+          }
+
+          this.prefetchCache = cache;
+
+          return cache;
         }
       }
     }
 
-    public override ItemDefinition GetItemDefinition(ID itemId, CallContext context)
+    [CanBeNull]
+    public override ItemDefinition GetItemDefinition([NotNull] ID itemId, [NotNull] CallContext context)
     {
-      PrefetchData prefetchData = GetPrefetchData(itemId);
+      Assert.ArgumentNotNull(itemId, "itemId");
+      Assert.ArgumentNotNull(context, "context");
+
+      PrefetchData prefetchData = this.GetPrefetchData(itemId);
       if (prefetchData == null)
       {
         return null;
       }
+
       return prefetchData.ItemDefinition;
     }
 
-    private PrefetchData GetPrefetchData(ID itemId)
+    [CanBeNull]
+    public override VersionUriList GetItemVersions([NotNull] ItemDefinition itemDefinition, [NotNull] CallContext context)
     {
-      PrefetchData data = this.PrefetchCache[itemId] as PrefetchData;
-      if (data != null)
+      Assert.ArgumentNotNull(itemDefinition, "itemDefinition");
+      Assert.ArgumentNotNull(context, "context");
+
+      var id = itemDefinition.ID;
+      Assert.IsNotNull(id, "id");
+
+      var result = this.items.FindOneById(id.ToGuid());
+      if (result == null)
       {
-        if (!data.ItemDefinition.IsEmpty)
-        {
-          return data;
-        }
         return null;
       }
-      ItemInfo result = Items.FindOneByIdAs<ItemInfo>(itemId.ToGuid());
 
-      if (result != null)
+      var versions = new VersionUriList();
+      var versionsList = new List<VersionUri>();
+      foreach (var fieldValueId in result.FieldValues.Keys.Where(fv => fv != null && fv.Version.HasValue && fv.Language != null))
       {
-        data = new PrefetchData(new ItemDefinition(itemId, result.Name, new ID(result.TemplateID), new ID(result.BranchID)), new ID(result.ParentID));
-        this.PrefetchCache.Add(itemId, data, data.GetDataLength());
-        return data;
+        if (fieldValueId == null)
+        {
+          continue;
+        }
+
+        if (versionsList.Any(ver => ver != null && fieldValueId.Matches(ver)))
+        {
+          continue;
+        }
+
+        var version = fieldValueId.Version;
+        Assert.IsNotNull(version, "version");
+
+        var newVersionUri = new VersionUri(LanguageManager.GetLanguage(fieldValueId.Language), new Sitecore.Data.Version(version.Value));
+        versionsList.Add(newVersionUri);
       }
 
-      return null;
-    }
-
-    public override VersionUriList GetItemVersions(ItemDefinition itemDefinition, CallContext context)
-    {
-      Item result = Items.FindOneById(itemDefinition.ID.ToGuid());
-      if (result != null && result.FieldValues != null)
+      foreach (var version in versionsList)
       {
-        VersionUriList versions = new VersionUriList();
-        var versionsList = new List<VersionUri>();
-        foreach (FieldValueId fieldValueId in result.FieldValues.Keys.Where(fv => fv.Version.HasValue && fv.Language != null))
-        {
-          if (versionsList.Where(ver => fieldValueId.Matches(ver)).Count() == 0)
-          {
-            VersionUri newVersionUri = new VersionUri(
-                Sitecore.Data.Managers.LanguageManager.GetLanguage(fieldValueId.Language),
-                new Sitecore.Data.Version(fieldValueId.Version.Value));
-            versionsList.Add(newVersionUri);
-          }
-        }
-        foreach (var version in versionsList)
-        {
-          versions.Add(version);
-        }
-        return versions;
+        versions.Add(version);
       }
-      return null;
+
+      return versions;
     }
 
-    public override FieldList GetItemFields(ItemDefinition itemDefinition, VersionUri versionUri, CallContext context)
+    [CanBeNull]
+    public override FieldList GetItemFields([NotNull] ItemDefinition itemDefinition, [NotNull] VersionUri versionUri, [NotNull] CallContext context)
     {
-      Item result = Items.FindOneById(itemDefinition.ID.ToGuid());
-      if (result != null && result.FieldValues != null)
+      Assert.ArgumentNotNull(itemDefinition, "itemDefinition");
+      Assert.ArgumentNotNull(versionUri, "versionUri");
+      Assert.ArgumentNotNull(context, "context");
+
+      var id = itemDefinition.ID;
+      Assert.IsNotNull(id, "id");
+
+      var result = this.items.FindOneById(id.ToGuid());
+      if (result == null)
       {
-        FieldList fields = new FieldList();
-        foreach (KeyValuePair<FieldValueId, string> fieldValue in result.FieldValues.Where(fv => fv.Key.Matches(versionUri)))
-        {
-          fields.Add(new ID(fieldValue.Key.FieldId), fieldValue.Value);
-        }
-        return fields;
+        return null;
       }
-      return null;
+
+      var fields = new FieldList();
+      foreach (var fieldValue in result.FieldValues.Where(fv => fv.Key != null && fv.Key.Matches(versionUri)))
+      {
+        var key = fieldValue.Key;
+        Assert.IsNotNull(key, "key");
+
+        fields.Add(new ID(key.FieldId), fieldValue.Value);
+      }
+
+      return fields;
     }
 
-    public override IDList GetChildIDs(ItemDefinition itemDefinition, CallContext context)
+    [NotNull]
+    public override IDList GetChildIDs([NotNull] ItemDefinition itemDefinition, [NotNull] CallContext context)
     {
-      var query = Query.EQ("ParentID",
-          itemDefinition.ID == JoinParentId
-              ? Guid.Empty
-              : itemDefinition.ID.ToGuid());
-      return IDList.Build(Items.FindAs<ItemBase>(query)
-          .Select(it => new ID(it._id)).ToArray());
+      Assert.ArgumentNotNull(itemDefinition, "itemDefinition");
+      Assert.ArgumentNotNull(context, "context");
+
+      var parentId = itemDefinition.ID == this.joinParentId ? Guid.Empty : itemDefinition.ID.ToGuid();
+      var query = Query.EQ("ParentID", parentId);
+      var cursor = this.items.FindAs<ItemBase>(query);
+      Assert.IsNotNull(cursor, "cursor");
+
+      return IDList.Build(cursor.Select(it => new ID(it.ID)).ToArray());
     }
 
-    public override ID GetParentID(ItemDefinition itemDefinition, CallContext context)
+    [CanBeNull]
+    public override ID GetParentID([NotNull] ItemDefinition itemDefinition, [NotNull] CallContext context)
     {
-      ItemBase result = Items.FindOneByIdAs<ItemBase>(itemDefinition.ID.ToGuid());
-      return result != null
-          ? (result.ParentID != Guid.Empty ? new ID(result.ParentID) : JoinParentId)
-          : null;
+      Assert.ArgumentNotNull(itemDefinition, "itemDefinition");
+      Assert.ArgumentNotNull(context, "context");
+
+      var result = this.items.FindOneByIdAs<ItemBase>(itemDefinition.ID.ToGuid());
+      return result != null ? (result.ParentID != Guid.Empty ? new ID(result.ParentID) : this.joinParentId) : null;
     }
 
     public override bool CreateItem(ID itemID, string itemName, ID templateID, ItemDefinition parent, CallContext context)
     {
-      ItemBase current = Items.FindOneByIdAs<ItemBase>(itemID.ToGuid());
+      var current = this.items.FindOneByIdAs<ItemBase>(itemID.ToGuid());
       if (current != null)
       {
         // item already exists
@@ -240,7 +262,7 @@ namespace MongoDataProvider
 
       if (parent != null)
       {
-        ItemBase parentItem = Items.FindOneByIdAs<ItemBase>(parent.ID.ToGuid());
+        var parentItem = this.items.FindOneByIdAs<ItemBase>(parent.ID.ToGuid());
         if (parentItem == null)
         {
           // parent item does not exist in this provider
@@ -248,74 +270,95 @@ namespace MongoDataProvider
         }
       }
 
-      Items.Save(new ItemInfo()
-          {
-            _id = itemID.ToGuid(),
-            Name = itemName,
-            TemplateID = templateID.ToGuid(),
-            ParentID = parent != null ? parent.ID.ToGuid() : Guid.Empty
-          }, SafeMode);
+      var itemInfo = new ItemInfo
+      {
+        ID = itemID.ToGuid(),
+        Name = itemName,
+        TemplateID = templateID.ToGuid(),
+        ParentID = parent != null ? parent.ID.ToGuid() : Guid.Empty
+      };
+
+      this.items.Save(itemInfo, this.safeMode);
 
       return true;
     }
 
-    public override int AddVersion(ItemDefinition itemDefinition, VersionUri baseVersion, CallContext context)
+    public override int AddVersion([NotNull] ItemDefinition itemDefinition, [NotNull] VersionUri baseVersion, [NotNull] CallContext context)
     {
-      Item current = Items.FindOneById(itemDefinition.ID.ToGuid());
+      Assert.ArgumentNotNull(itemDefinition, "itemDefinition");
+      Assert.ArgumentNotNull(baseVersion, "baseVersion");
+      Assert.ArgumentNotNull(context, "context");
+
+      Data.Item current = this.items.FindOneById(itemDefinition.ID.ToGuid());
       if (current == null)
       {
         return -1;
       }
 
-      int num = -1;
-
+      var num = -1;
       if (baseVersion.Version != null && baseVersion.Version.Number > 0)
       {
         // copy version
         var currentFieldValues = current.FieldValues.Where(fv => fv.Key.Matches(baseVersion)).ToList();
-        int? maxVersionNumber = currentFieldValues.Max(fv => fv.Key.Version);
+        var maxVersionNumber = currentFieldValues.Max(fv => fv.Key.Version);
         num = maxVersionNumber.HasValue && maxVersionNumber > 0 ? maxVersionNumber.Value + 1 : -1;
 
         if (num > 0)
         {
           foreach (KeyValuePair<FieldValueId, string> fieldValue in currentFieldValues)
           {
-            current.FieldValues.Add(new FieldValueId()
-                {
-                  FieldId = fieldValue.Key.FieldId,
-                  Language = fieldValue.Key.Language,
-                  Version = num
-                }, fieldValue.Value);
+            var key = fieldValue.Key;
+            Assert.IsNotNull(key, "key");
+
+            var fieldValueId = new FieldValueId
+            {
+              FieldId = key.FieldId,
+              Language = key.Language,
+              Version = num
+            };
+
+            current.FieldValues.Add(fieldValueId, fieldValue.Value);
           }
         }
       }
+
       if (num == -1)
       {
         num = 1;
 
         // add blank version
-        current.FieldValues.Add(new FieldValueId()
-            {
-              FieldId = FieldIDs.Created.ToGuid(),
-              Language = baseVersion.Language.Name,
-              Version = num
-            }, string.Empty);
+        var fieldValueId = new FieldValueId()
+        {
+          FieldId = FieldIDs.Created.ToGuid(),
+          Language = baseVersion.Language.Name,
+          Version = num
+        };
+
+        current.FieldValues.Add(fieldValueId, string.Empty);
       }
 
-      Items.Save(current, SafeMode);
+      this.items.Save(current, this.safeMode);
 
       return num;
     }
 
-    public override bool DeleteItem(ItemDefinition itemDefinition, CallContext context)
+    public override bool DeleteItem([NotNull] ItemDefinition itemDefinition, [NotNull] CallContext context)
     {
-      SafeModeResult result = Items.Remove(Query.EQ("_id", itemDefinition.ID.ToGuid()), RemoveFlags.Single, SafeMode);
+      Assert.ArgumentNotNull(itemDefinition, "itemDefinition");
+      Assert.ArgumentNotNull(context, "context");
+
+      var result = this.items.Remove(Query.EQ("_id", itemDefinition.ID.ToGuid()), RemoveFlags.Single, this.safeMode);
+
       return result != null && result.Ok;
     }
 
-    public override bool SaveItem(ItemDefinition itemDefinition, Sitecore.Data.Items.ItemChanges changes, CallContext context)
+    public override bool SaveItem([NotNull] ItemDefinition itemDefinition, [NotNull] Sitecore.Data.Items.ItemChanges changes, [NotNull] CallContext context)
     {
-      Item current = Items.FindOneById(itemDefinition.ID.ToGuid());
+      Assert.ArgumentNotNull(itemDefinition, "itemDefinition");
+      Assert.ArgumentNotNull(changes, "changes");
+      Assert.ArgumentNotNull(context, "context");
+
+      var current = this.items.FindOneById(itemDefinition.ID.ToGuid());
       if (current == null)
       {
         return false;
@@ -325,84 +368,165 @@ namespace MongoDataProvider
       {
         current.Name = StringUtil.GetString(changes.GetPropertyValue("name"), itemDefinition.Name);
 
-        ID templateId = MainUtil.GetObject(changes.GetPropertyValue("templateid"), itemDefinition.TemplateID) as ID;
+        var templateId = MainUtil.GetObject(changes.GetPropertyValue("templateid"), itemDefinition.TemplateID) as ID;
         current.TemplateID = templateId != ID.Null ? templateId.ToGuid() : Guid.Empty;
 
-        ID branchId = MainUtil.GetObject(changes.GetPropertyValue("branchid"), itemDefinition.BranchId) as ID;
+        var branchId = MainUtil.GetObject(changes.GetPropertyValue("branchid"), itemDefinition.BranchId) as ID;
         current.BranchID = branchId != ID.Null ? branchId.ToGuid() : Guid.Empty;
       }
-      if (changes.HasFieldsChanged)
-      {
-        foreach (Sitecore.Data.Items.FieldChange change in changes.FieldChanges)
-        {
-          VersionUri fieldVersionUri = new VersionUri(
-              change.Definition == null || change.Definition.IsShared ? null : change.Language,
-              change.Definition == null || change.Definition.IsUnversioned ? null : change.Version);
-          var matchingFields = current.FieldValues.Where(fv => fv.Key.Matches(fieldVersionUri) && fv.Key.FieldId.Equals(change.FieldID.ToGuid()));
 
-          if (change.RemoveField)
+      if (!changes.HasFieldsChanged)
+      {
+        return true;
+      }
+
+      foreach (FieldChange change in changes.FieldChanges)
+      {
+        if (change == null)
+        {
+          continue;
+        }
+
+        var fieldVersionUri = new VersionUri(
+          change.Definition == null || change.Definition.IsShared ? null : change.Language,
+          change.Definition == null || change.Definition.IsUnversioned ? null : change.Version);
+
+        var matchingFields = current.FieldValues.Where(fv => fv.Key.Matches(fieldVersionUri) && fv.Key.FieldId.Equals(change.FieldID.ToGuid()));
+        Assert.IsNotNull(matchingFields, "matchingFields");
+        
+        if (change.RemoveField)
+        {
+          if (matchingFields.Any())
           {
-            if (matchingFields.Count() > 0)
-            {
-              current.FieldValues.Remove(matchingFields.First().Key);
-            }
+            current.FieldValues.Remove(matchingFields.First().Key);
+          }
+        }
+        else
+        {
+          if (matchingFields.Any())
+          {
+            current.FieldValues[matchingFields.First().Key] = change.Value;
           }
           else
           {
-            if (matchingFields.Count() > 0)
+            var fieldValueId = new FieldValueId()
             {
-              current.FieldValues[matchingFields.First().Key] = change.Value;
-            }
-            else
-            {
-              current.FieldValues.Add(new FieldValueId()
-                  {
-                    FieldId = change.FieldID.ToGuid(),
-                    Language = fieldVersionUri.Language != null ? fieldVersionUri.Language.Name : null,
-                    Version = fieldVersionUri.Version != null ? fieldVersionUri.Version.Number : null as int?
-                  }, change.Value);
-            }
+              FieldId = change.FieldID.ToGuid(),
+              Language = fieldVersionUri.Language != null ? fieldVersionUri.Language.Name : null,
+              Version = fieldVersionUri.Version != null ? fieldVersionUri.Version.Number : null as int?
+            };
+
+            current.FieldValues.Add(fieldValueId, change.Value);
           }
         }
-
-        Items.Save(current, SafeMode);
       }
+
+      this.items.Save(current, this.safeMode);
+
       return true;
     }
 
-    public override IdCollection GetTemplateItemIds(CallContext context)
+    [NotNull]
+    public override IdCollection GetTemplateItemIds([NotNull] CallContext context)
     {
+      Assert.ArgumentNotNull(context, "context");
       var query = Query.EQ("TemplateID", TemplateIDs.Template.ToGuid());
-      IdCollection ids = new IdCollection();
-      foreach (var id in Items.FindAs<ItemBase>(query).Select(it => new ID(it._id)))
+      var ids = new IdCollection();
+
+      var cursor = this.items.FindAs<ItemBase>(query);
+      Assert.IsNotNull(cursor, "cursor");
+
+      foreach (var id in cursor.Select(it => new ID(it.ID)))
       {
         ids.Add(id);
       }
+
       return ids;
     }
 
-    public override ID GetRootID(CallContext context)
+    public override bool BlobStreamExists(Guid blobId, [NotNull] CallContext context)
     {
-      return ItemIDs.RootID;
+      Assert.ArgumentNotNull(context, "context");
+
+      return this.gridFs.Exists(Query.EQ("filename", new BsonString(new ShortID(blobId).ToString())));
     }
 
-    public override bool BlobStreamExists(Guid blobId, CallContext context)
+    [CanBeNull]
+    public override Stream GetBlobStream(Guid blobId, [NotNull] CallContext context)
     {
-      return Db.GridFS.Exists(Query.EQ("filename", new MongoDB.Bson.BsonString(new ShortID(blobId).ToString())));
-    }
+      Assert.ArgumentNotNull(context, "context");
+      var gridFsFile = this.database.GridFS.FindOne(Query.EQ("filename", new BsonString(new ShortID(blobId).ToString())));
 
-    public override System.IO.Stream GetBlobStream(Guid blobId, CallContext context)
-    {
-      var gridFsFile = Db.GridFS.FindOne(Query.EQ("filename", new MongoDB.Bson.BsonString(new ShortID(blobId).ToString())));
       return gridFsFile != null && gridFsFile.Exists ? gridFsFile.OpenRead() : null;
     }
 
-    public override bool SetBlobStream(System.IO.Stream stream, Guid blobId, CallContext context)
+    public override bool SetBlobStream([NotNull] System.IO.Stream stream, Guid blobId, [NotNull] CallContext context)
     {
-      var result = Db.GridFS.Upload(
-          stream,
-          new ShortID(blobId).ToString());
+      Assert.ArgumentNotNull(stream, "stream");
+      Assert.ArgumentNotNull(context, "context");
+
+      var result = this.gridFs.Upload(stream, new ShortID(blobId).ToString());
+
       return result != null;
+    }
+
+    [CanBeNull]
+    private PrefetchData GetPrefetchData([NotNull] ID itemId)
+    {
+      Assert.ArgumentNotNull(itemId, "itemId");
+      var data = this.PrefetchCache[itemId] as PrefetchData;
+      if (data != null)
+      {
+        if (!data.ItemDefinition.IsEmpty)
+        {
+          return data;
+        }
+
+        return null;
+      }
+
+      var result = this.items.FindOneByIdAs<ItemInfo>(itemId.ToGuid());
+
+      if (result == null)
+      {
+        return null;
+      }
+
+      data = new PrefetchData(new ItemDefinition(itemId, result.Name, new ID(result.TemplateID), new ID(result.BranchID)), new ID(result.ParentID));
+      this.PrefetchCache.Add(itemId, data, data.GetDataLength());
+
+      return data;
+    }
+
+    [NotNull]
+    private MongoCollection<Data.Item> GetItemsCollection([NotNull] MongoDatabase db, [NotNull] SafeMode mode)
+    {
+      Assert.ArgumentNotNull(db, "db");
+      Assert.ArgumentNotNull(mode, "mode");
+
+      var collection = db.GetCollection<Data.Item>("items", this.safeMode);
+      Assert.IsNotNull(collection, "collection");
+
+      collection.EnsureIndex(IndexKeys.Ascending(new[] { "ParentID" }));
+      collection.EnsureIndex(IndexKeys.Ascending(new[] { "TemplateID" }));
+
+      // ensure not empty
+      if (collection.Count() > 0)
+      {
+        return collection;
+      }
+
+      // Create a root item and insert it
+      var rootItem = new Data.Item
+      {
+        ID = new ID("{11111111-1111-1111-1111-111111111111}").ToGuid(),
+        Name = "sitecore",
+        TemplateID = new ID("{C6576836-910C-4A3D-BA03-C277DBD3B827}").ToGuid()
+      };
+
+      collection.Insert(rootItem, mode);
+
+      return collection;
     }
   }
 }

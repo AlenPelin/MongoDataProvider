@@ -25,7 +25,7 @@ namespace MongoDataProvider.Data
   [BsonIgnoreExtraElements]
   public class ItemBase
   {
-    public Guid _id { get; set; }
+    public Guid ID { get; set; }
 
     public Guid ParentID { get; set; }
   }

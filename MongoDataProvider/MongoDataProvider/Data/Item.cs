@@ -35,12 +35,13 @@ namespace MongoDataProvider.Data
     {
       get
       {
-        return fieldValues ?? (fieldValues = new Dictionary<FieldValueId, string>());
+        return this.fieldValues ?? (this.fieldValues = new Dictionary<FieldValueId, string>());
       }
+
       set
       {
         Assert.ArgumentNotNull(value, "value");
-        fieldValues = value;
+        this.fieldValues = value;
       }
     }
   }
