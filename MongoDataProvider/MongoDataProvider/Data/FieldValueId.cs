@@ -1,6 +1,7 @@
 ﻿/*
     MongoDB DataProvider Sitecore module
     Copyright (C) 2012  Robin Hermanussen
+    Copyright (C) 2015  Alen Pelin
 
     This program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -15,31 +16,34 @@
     You should have received a copy of the GNU General Public License
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
-using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using Sitecore.Data;
 
 namespace MongoDataProvider.Data
 {
-    public class FieldValueId
+  using System;
+  using Sitecore;
+  using Sitecore.Data;
+  using Sitecore.Diagnostics;
+
+  public class FieldValueId
+  {
+    public Guid FieldId { get; set; }
+
+    [NotNull]
+    public string Language { get; set; }
+
+    public int? Version { get; set; }
+
+    public bool Matches([NotNull] VersionUri versionUri)
     {
-        public Guid FieldId { get; set; }
+      Assert.ArgumentNotNull(versionUri, "versionUri");
 
-        public string Language { get; set; }
+      string versionUriLanguage = versionUri.Language != null ? versionUri.Language.Name : null;
+      int? versionUriVersion = versionUri.Version != null ? versionUri.Version.Number : null as int?;
 
-        public int? Version { get; set; }
+      bool matchesLanguage = string.IsNullOrWhiteSpace(Language) || Language.Equals(versionUriLanguage);
+      bool matchesVersion = !Version.HasValue || Version.Equals(versionUriVersion);
 
-        public bool Matches(VersionUri versionUri)
-        {
-            string versionUriLanguage = versionUri.Language != null ? versionUri.Language.Name : null;
-            int? versionUriVersion = versionUri.Version != null ? versionUri.Version.Number : null as int?;
-
-            bool matchesLanguage = string.IsNullOrWhiteSpace(Language) || Language.Equals(versionUriLanguage);
-            bool matchesVersion = ! Version.HasValue || Version.Equals(versionUriVersion);
-
-            return matchesLanguage && matchesVersion;
-        }
+      return matchesLanguage && matchesVersion;
     }
+  }
 }

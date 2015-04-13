@@ -1,6 +1,7 @@
 ﻿/*
     MongoDB DataProvider Sitecore module
     Copyright (C) 2012  Robin Hermanussen
+    Copyright (C) 2015  Alen Pelin
 
     This program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -15,28 +16,28 @@
     You should have received a copy of the GNU General Public License
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
-using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using MongoDB.Bson.Serialization.Attributes;
 
 namespace MongoDataProvider.Data
 {
-    [BsonIgnoreExtraElements]
-    public class ItemInfo : ItemBase
+  using System;
+  using MongoDB.Bson.Serialization.Attributes;
+  using Sitecore;
+
+  [BsonIgnoreExtraElements]
+  public class ItemInfo : ItemBase
+  {
+    [BsonRequired]
+    [NotNull]
+    public string Name { get; set; }
+
+    [BsonRequired]
+    public Guid TemplateID { get; set; }
+
+    public Guid BranchID { get; set; }
+
+    public override string ToString()
     {
-        [BsonRequired]
-        public string Name { get; set; }
-
-        [BsonRequired]
-        public Guid TemplateID { get; set; }
-
-        public Guid BranchID { get; set; }
-
-        public override string ToString()
-        {
-            return string.Format("{0} ({1})", Name, _id);
-        }
+      return string.Format("{0} ({1})", this.Name, this._id);
     }
+  }
 }

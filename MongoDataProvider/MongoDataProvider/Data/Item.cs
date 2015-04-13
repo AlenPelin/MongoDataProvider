@@ -1,6 +1,7 @@
 ﻿/*
     MongoDB DataProvider Sitecore module
     Copyright (C) 2012  Robin Hermanussen
+    Copyright (C) 2015  Alen Pelin
 
     This program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -15,30 +16,32 @@
     You should have received a copy of the GNU General Public License
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
-using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using MongoDB.Bson.Serialization.Attributes;
-using MongoDB.Bson.Serialization.Options;
 
 namespace MongoDataProvider.Data
 {
-    public class Item : ItemInfo
-    {
-        private Dictionary<FieldValueId, string> fieldValues;
+  using System.Collections.Generic;
+  using MongoDB.Bson.Serialization.Attributes;
+  using MongoDB.Bson.Serialization.Options;
+  using Sitecore;
+  using Sitecore.Diagnostics;
 
-        [BsonDictionaryOptions(DictionaryRepresentation.ArrayOfDocuments)]
-        public Dictionary<FieldValueId, string> FieldValues
-        {
-            get
-            {
-                return fieldValues ?? (fieldValues = new Dictionary<FieldValueId,string>());
-            }
-            set
-            {
-                fieldValues = value;
-            }
-        }
+  public class Item : ItemInfo
+  {
+    private Dictionary<FieldValueId, string> fieldValues;
+
+    [BsonDictionaryOptions(DictionaryRepresentation.ArrayOfDocuments)]
+    [NotNull]
+    public Dictionary<FieldValueId, string> FieldValues
+    {
+      get
+      {
+        return fieldValues ?? (fieldValues = new Dictionary<FieldValueId, string>());
+      }
+      set
+      {
+        Assert.ArgumentNotNull(value, "value");
+        fieldValues = value;
+      }
     }
+  }
 }
