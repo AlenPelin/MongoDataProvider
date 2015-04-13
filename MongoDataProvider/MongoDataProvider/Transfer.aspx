@@ -21,9 +21,8 @@
 <%@ Import Namespace="Sitecore.Data.DataProviders" %>
 <%@ Import Namespace="Sitecore.Data.Items" %>
 <%@ Import Namespace="Sitecore.Data.Fields" %>
-<% Sitecore.Shell.Web.ShellPage.IsLoggedIn();%>
 <%
-if (! Sitecore.Context.User.IsInRole(@"sitecore\Developer")
+if (true
     && ! Sitecore.Context.IsAdministrator)
 {
     Response.Write("<p>You are not authorized to use this page</p>");

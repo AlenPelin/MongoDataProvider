@@ -226,7 +226,7 @@ namespace MongoDataProvider
         /// <returns></returns>
         public override IDList GetChildIDs(ItemDefinition itemDefinition, CallContext context)
         {
-            QueryComplete query = Query.EQ("ParentID",
+            var query = Query.EQ("ParentID",
                 itemDefinition.ID == JoinParentId
                     ? Guid.Empty
                     : itemDefinition.ID.ToGuid());
@@ -421,7 +421,7 @@ namespace MongoDataProvider
 
         public override IdCollection GetTemplateItemIds(CallContext context)
         {
-            QueryComplete query = Query.EQ("TemplateID", TemplateIDs.Template.ToGuid());
+            var query = Query.EQ("TemplateID", TemplateIDs.Template.ToGuid());
             IdCollection ids = new IdCollection();
             foreach (var id in Items.FindAs<ItemBase>(query).Select(it => new ID(it._id)))
             {
